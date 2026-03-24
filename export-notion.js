@@ -198,8 +198,23 @@ async function main() {
   }
   fs.mkdirSync("docs", { recursive: true });
 
-  console.log(`Starting export from root page: ${ROOT_PAGE_ID}\n`);
-  await exportPage(ROOT_PAGE_ID);
+  // Auto-detect whether the root ID is a page or a database
+  await rateLimit();
+  const rootObject = await notion.pages.retrieve({ page_id: ROOT_PAGE_ID }).catch(async (err) => {
+    if (err?.code === "validation_error" && err?.message?.includes("database")) {
+      return { object: "database", id: ROOT_PAGE_ID };
+    }
+    throw err;
+  });
+
+  console.log(`Starting export from root ${rootObject.object}: ${ROOT_PAGE_ID}\n`);
+
+  if (rootObject.object === "database") {
+    await exportDatabase(ROOT_PAGE_ID, "docs");
+  } else {
+    await exportPage(ROOT_PAGE_ID);
+  }
+
   console.log("\n✅ Full export complete");
 }
 
