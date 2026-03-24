@@ -1,35 +1,32 @@
 name: Sync Notion to GitHub
-
 on:
   schedule:
     - cron: "0 13 * * *"
   workflow_dispatch:
-
 permissions:
-  contents: write  # 🔥 REQUIRED for git push
-
+  contents: write
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-
       - name: Install dependencies
         run: npm install
-
+      - name: Inspect Notion structure
+        run: node inspect-notion.js
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
       - name: Run export
         run: node export-notion.js
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
-
       - name: Commit and push changes
         run: |
           git config user.name "notion-sync-bot"
