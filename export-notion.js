@@ -6,78 +6,205 @@ const path = require("path");
 const notion = new Client({
   auth: process.env.NOTION_TOKEN,
 });
-
 const n2m = new NotionToMarkdown({ notionClient: notion });
-
 const ROOT_PAGE_ID = process.env.NOTION_PAGE_ID;
 
-// Clean filename
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Wrap every Notion API call with a small delay to stay under ~3 req/s
+async function rateLimit() {
+  await sleep(350);
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function cleanFileName(name) {
-  return name
+  return String(name || "untitled")
     .replace(/[<>:"/\\|?*]+/g, "")
     .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
     .toLowerCase();
 }
 
-// Get title safely
-function getTitle(block) {
-  if (block.child_page) return block.child_page.title;
+function getPageTitleFromPageObject(page) {
+  if (!page || !page.properties) return "untitled";
+  for (const key of Object.keys(page.properties)) {
+    const prop = page.properties[key];
+    if (prop && prop.type === "title" && Array.isArray(prop.title)) {
+      return prop.title.map((t) => t.plain_text).join("").trim() || "untitled";
+    }
+  }
   return "untitled";
 }
 
-// Recursively traverse pages
-async function traverse(pageId, folder = "docs") {
-  const mdBlocks = await n2m.pageToMarkdown(pageId);
-  const mdString = n2m.toMarkdownString(mdBlocks);
-
-  // Get page info
+async function getPageTitle(pageId) {
+  await rateLimit();
   const page = await notion.pages.retrieve({ page_id: pageId });
-  const title =
-    page.properties?.title?.title[0]?.plain_text || "untitled";
+  return getPageTitleFromPageObject(page);
+}
 
-  const fileName = cleanFileName(title) + ".md";
-
-  if (!fs.existsSync(folder)) {
-    fs.mkdirSync(folder, { recursive: true });
-  }
-
-  const filePath = path.join(folder, fileName);
-  fs.writeFileSync(filePath, mdString.parent || "", "utf8");
-
-  console.log(`Exported: ${fileName}`);
-
-  // Get children blocks
-  let hasMore = true;
+// ─── Child block fetching (pages + databases) ─────────────────────────────────
+async function getChildBlocks(blockId) {
+  let results = [];
   let cursor = undefined;
+  let hasMore = true;
 
   while (hasMore) {
+    await rateLimit();
     const response = await notion.blocks.children.list({
-      block_id: pageId,
+      block_id: blockId,
       start_cursor: cursor,
+      page_size: 100,
     });
 
-    for (const block of response.results) {
-      if (block.type === "child_page") {
-        await traverse(block.id, folder);
-      }
-    }
+    // Collect both child_page and child_database blocks
+    const children = response.results.filter(
+      (b) => b.type === "child_page" || b.type === "child_database"
+    );
+    results.push(...children);
 
     hasMore = response.has_more;
     cursor = response.next_cursor;
   }
+
+  return results;
 }
 
+// ─── Database handling ────────────────────────────────────────────────────────
+async function getDatabaseTitle(databaseId) {
+  await rateLimit();
+  const db = await notion.databases.retrieve({ database_id: databaseId });
+  if (db.title && db.title.length > 0) {
+    return db.title.map((t) => t.plain_text).join("").trim() || "untitled-db";
+  }
+  return "untitled-db";
+}
+
+async function getDatabasePages(databaseId) {
+  let results = [];
+  let cursor = undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    await rateLimit();
+    const response = await notion.databases.query({
+      database_id: databaseId,
+      start_cursor: cursor,
+      page_size: 100,
+    });
+
+    results.push(...response.results);
+    hasMore = response.has_more;
+    cursor = response.next_cursor;
+  }
+
+  return results;
+}
+
+// ─── Core export ──────────────────────────────────────────────────────────────
+async function exportPage(pageId, outDir = "docs", visited = new Set()) {
+  if (visited.has(pageId)) return;
+  visited.add(pageId);
+
+  const title = await getPageTitle(pageId);
+  const folderName = cleanFileName(title);
+  const pageDir = path.join(outDir, folderName);
+  fs.mkdirSync(pageDir, { recursive: true });
+
+  // Export page content
+  await rateLimit();
+  const mdBlocks = await n2m.pageToMarkdown(pageId);
+  const mdString = n2m.toMarkdownString(mdBlocks);
+  const content = mdString.parent || "";
+
+  if (!content.trim()) {
+    console.warn(`  ⚠ Empty export for page: "${title}" (${pageId})`);
+  }
+
+  fs.writeFileSync(path.join(pageDir, "index.md"), content, "utf8");
+  console.log(`✓ Page: ${path.join(outDir, folderName, "index.md")}`);
+
+  // Recurse into child pages and databases
+  const children = await getChildBlocks(pageId);
+  for (const child of children) {
+    if (child.type === "child_page") {
+      await exportPage(child.id, pageDir, visited);
+    } else if (child.type === "child_database") {
+      await exportDatabase(child.id, pageDir, visited);
+    }
+  }
+}
+
+async function exportDatabase(databaseId, outDir, visited = new Set()) {
+  if (visited.has(databaseId)) return;
+  visited.add(databaseId);
+
+  const title = await getDatabaseTitle(databaseId);
+  const folderName = cleanFileName(title);
+  const dbDir = path.join(outDir, folderName);
+  fs.mkdirSync(dbDir, { recursive: true });
+
+  console.log(`✓ Database: ${dbDir}/`);
+
+  // Export each page inside the database
+  const pages = await getDatabasePages(databaseId);
+  for (const page of pages) {
+    if (visited.has(page.id)) continue;
+    visited.add(page.id);
+
+    const pageTitle = getPageTitleFromPageObject(page);
+    const folderName = cleanFileName(pageTitle);
+    const pageDir = path.join(dbDir, folderName);
+    fs.mkdirSync(pageDir, { recursive: true });
+
+    await rateLimit();
+    const mdBlocks = await n2m.pageToMarkdown(page.id);
+    const mdString = n2m.toMarkdownString(mdBlocks);
+    const content = mdString.parent || "";
+
+    if (!content.trim()) {
+      console.warn(`  ⚠ Empty export for db page: "${pageTitle}" (${page.id})`);
+    }
+
+    fs.writeFileSync(path.join(pageDir, "index.md"), content, "utf8");
+    console.log(`  ✓ DB page: ${path.join(dbDir, folderName, "index.md")}`);
+
+    // Each database page can itself have child pages/databases
+    const children = await getChildBlocks(page.id);
+    for (const child of children) {
+      if (child.type === "child_page") {
+        await exportPage(child.id, pageDir, visited);
+      } else if (child.type === "child_database") {
+        await exportDatabase(child.id, pageDir, visited);
+      }
+    }
+  }
+}
+
+// ─── Entry point ──────────────────────────────────────────────────────────────
 async function main() {
-  // 🔥 Force clean docs folder (fix "everything up-to-date")
+  if (!ROOT_PAGE_ID) {
+    throw new Error("Missing NOTION_PAGE_ID env variable");
+  }
+  if (!process.env.NOTION_TOKEN) {
+    throw new Error("Missing NOTION_TOKEN env variable");
+  }
+
   if (fs.existsSync("docs")) {
     fs.rmSync("docs", { recursive: true, force: true });
   }
-
   fs.mkdirSync("docs", { recursive: true });
 
-  await traverse(ROOT_PAGE_ID);
-
-  console.log("Full export complete");
+  console.log(`Starting export from root page: ${ROOT_PAGE_ID}\n`);
+  await exportPage(ROOT_PAGE_ID);
+  console.log("\n✅ Full export complete");
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error("\n❌ Export failed:");
+  console.error(err);
+  process.exit(1);
+});
