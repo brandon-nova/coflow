@@ -11,38 +11,80 @@ const n2m = new NotionToMarkdown({ notionClient: notion });
 
 const ROOT_PAGE_ID = process.env.NOTION_PAGE_ID;
 
-async function exportPage(pageId, outDir = "docs") {
+// Clean filename
+function cleanFileName(name) {
+  return name
+    .replace(/[<>:"/\\|?*]+/g, "")
+    .replace(/\s+/g, "-")
+    .toLowerCase();
+}
+
+// Get page title
+function getPageTitle(page) {
+  return page.properties?.title?.title[0]?.plain_text || "untitled";
+}
+
+// Get all pages in workspace
+async function getAllPages() {
+  let results = [];
+  let hasMore = true;
+  let cursor = undefined;
+
+  while (hasMore) {
+    const response = await notion.search({
+      start_cursor: cursor,
+      filter: { property: "object", value: "page" },
+      page_size: 100,
+    });
+
+    results = results.concat(response.results);
+    hasMore = response.has_more;
+    cursor = response.next_cursor;
+  }
+
+  return results;
+}
+
+// Check if page is under root
+function isChildOfRoot(page) {
+  return page.parent?.page_id === ROOT_PAGE_ID;
+}
+
+async function exportPage(page) {
+  const pageId = page.id;
+  const title = getPageTitle(page);
+  const fileName = cleanFileName(title) + ".md";
+
   const mdBlocks = await n2m.pageToMarkdown(pageId);
   const mdString = n2m.toMarkdownString(mdBlocks);
 
-  if (!fs.existsSync(outDir)) {
-    fs.mkdirSync(outDir, { recursive: true });
-  }
-
-  const filePath = path.join(outDir, `${pageId}.md`);
+  const filePath = path.join("docs", fileName);
   fs.writeFileSync(filePath, mdString.parent || "", "utf8");
 
-  const children = await notion.blocks.children.list({
-    block_id: pageId,
-  });
-
-  for (const block of children.results) {
-    if (block.type === "child_page") {
-      await exportPage(block.id, outDir);
-    }
-  }
+  console.log(`Exported: ${fileName}`);
 }
 
 async function main() {
-  if (!ROOT_PAGE_ID) {
-    throw new Error("Missing NOTION_PAGE_ID");
+  if (!fs.existsSync("docs")) {
+    fs.mkdirSync("docs", { recursive: true });
   }
 
-  await exportPage(ROOT_PAGE_ID, "docs");
-  console.log("Notion export complete");
+  const pages = await getAllPages();
+
+  // Export root page
+  const rootPage = pages.find(p => p.id === ROOT_PAGE_ID);
+  if (rootPage) {
+    await exportPage(rootPage);
+  }
+
+  // Export children
+  for (const page of pages) {
+    if (isChildOfRoot(page)) {
+      await exportPage(page);
+    }
+  }
+
+  console.log("Export complete");
 }
 
-main().catch((err) => {
-  console.error(err);
-  process.exit(1);
-});
+main().catch(console.error);
