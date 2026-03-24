@@ -13,7 +13,6 @@ const ROOT_PAGE_ID = process.env.NOTION_PAGE_ID;
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
-
 async function rateLimit() {
   await sleep(350);
 }
@@ -45,7 +44,16 @@ async function getPageTitle(pageId) {
   return getPageTitleFromPageObject(page);
 }
 
-// ─── Child block fetching (pages + databases) ─────────────────────────────────
+async function getDatabaseTitle(databaseId) {
+  await rateLimit();
+  const db = await notion.databases.retrieve({ database_id: databaseId });
+  if (db.title && db.title.length > 0) {
+    return db.title.map((t) => t.plain_text).join("").trim() || "untitled-db";
+  }
+  return "untitled-db";
+}
+
+// ─── Fetch ALL child blocks (pages + databases) under a block ─────────────────
 async function getChildBlocks(blockId) {
   let results = [];
   let cursor = undefined;
@@ -58,9 +66,32 @@ async function getChildBlocks(blockId) {
       start_cursor: cursor,
       page_size: 100,
     });
+    results.push(...response.results);
+    hasMore = response.has_more;
+    cursor = response.next_cursor;
+  }
+
+  return results;
+}
+
+// ─── Fetch child databases whose parent is a given page (via search) ──────────
+// This catches databases that are children of a page but don't appear
+// as simple child_database blocks (common with full-page databases in Notion).
+async function getChildDatabases(pageId) {
+  let results = [];
+  let cursor = undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    await rateLimit();
+    const response = await notion.search({
+      filter: { object: "database" },
+      start_cursor: cursor,
+      page_size: 100,
+    });
 
     const children = response.results.filter(
-      (b) => b.type === "child_page" || b.type === "child_database"
+      (db) => db.parent?.type === "page_id" && db.parent?.page_id?.replace(/-/g, "") === pageId.replace(/-/g, "")
     );
     results.push(...children);
 
@@ -71,16 +102,7 @@ async function getChildBlocks(blockId) {
   return results;
 }
 
-// ─── Database handling ────────────────────────────────────────────────────────
-async function getDatabaseTitle(databaseId) {
-  await rateLimit();
-  const db = await notion.databases.retrieve({ database_id: databaseId });
-  if (db.title && db.title.length > 0) {
-    return db.title.map((t) => t.plain_text).join("").trim() || "untitled-db";
-  }
-  return "untitled-db";
-}
-
+// ─── Fetch all pages inside a database ───────────────────────────────────────
 async function getDatabasePages(databaseId) {
   let results = [];
   let cursor = undefined;
@@ -93,7 +115,6 @@ async function getDatabasePages(databaseId) {
       start_cursor: cursor,
       page_size: 100,
     });
-
     results.push(...response.results);
     hasMore = response.has_more;
     cursor = response.next_cursor;
@@ -124,13 +145,20 @@ async function exportPage(pageId, outDir, visited) {
   fs.writeFileSync(path.join(pageDir, "index.md"), content, "utf8");
   console.log(`✓ Page: ${pageDir}/index.md`);
 
-  const children = await getChildBlocks(pageId);
-  for (const child of children) {
-    if (child.type === "child_page") {
-      await exportPage(child.id, pageDir, visited);
-    } else if (child.type === "child_database") {
-      await exportDatabase(child.id, pageDir, visited, false);
+  // 1. Handle child_page and inline child_database blocks
+  const blocks = await getChildBlocks(pageId);
+  for (const block of blocks) {
+    if (block.type === "child_page") {
+      await exportPage(block.id, pageDir, visited);
+    } else if (block.type === "child_database") {
+      await exportDatabase(block.id, pageDir, visited, false);
     }
+  }
+
+  // 2. Handle full-page child databases (parented to this page, not inline blocks)
+  const childDbs = await getChildDatabases(pageId);
+  for (const db of childDbs) {
+    await exportDatabase(db.id, pageDir, visited, false);
   }
 }
 
@@ -138,12 +166,10 @@ async function exportDatabase(databaseId, outDir, visited, isRoot = false) {
   if (visited.has(databaseId)) return;
   visited.add(databaseId);
 
-  // Root-level database: export pages directly into outDir, no wrapping folder.
-  // Nested database: create a named subfolder.
   let dbDir;
   if (isRoot) {
     dbDir = outDir;
-    console.log(`✓ Root database → exporting pages directly into ${dbDir}/\n`);
+    console.log(`✓ Root database → exporting pages into ${dbDir}/\n`);
   } else {
     const title = await getDatabaseTitle(databaseId);
     const folderName = cleanFileName(title);
@@ -159,9 +185,8 @@ async function exportDatabase(databaseId, outDir, visited, isRoot = false) {
 
     const pageTitle = getPageTitleFromPageObject(page);
 
-    // Skip untitled placeholder rows
     if (pageTitle === "untitled") {
-      console.warn(`  ⚠ Skipping untitled db entry (${page.id}) — likely an empty row`);
+      console.warn(`  ⚠ Skipping untitled db entry (${page.id})`);
       continue;
     }
 
@@ -181,13 +206,20 @@ async function exportDatabase(databaseId, outDir, visited, isRoot = false) {
     fs.writeFileSync(path.join(pageDir, "index.md"), content, "utf8");
     console.log(`  ✓ DB page: ${pageDir}/index.md`);
 
-    const children = await getChildBlocks(page.id);
-    for (const child of children) {
-      if (child.type === "child_page") {
-        await exportPage(child.id, pageDir, visited);
-      } else if (child.type === "child_database") {
-        await exportDatabase(child.id, pageDir, visited, false);
+    // 1. Inline child blocks (child_page, child_database)
+    const blocks = await getChildBlocks(page.id);
+    for (const block of blocks) {
+      if (block.type === "child_page") {
+        await exportPage(block.id, pageDir, visited);
+      } else if (block.type === "child_database") {
+        await exportDatabase(block.id, pageDir, visited, false);
       }
+    }
+
+    // 2. Full-page child databases parented to this page
+    const childDbs = await getChildDatabases(page.id);
+    for (const db of childDbs) {
+      await exportDatabase(db.id, pageDir, visited, false);
     }
   }
 }
@@ -202,7 +234,6 @@ async function main() {
   }
   fs.mkdirSync("docs", { recursive: true });
 
-  // Auto-detect whether root ID is a page or a database
   await rateLimit();
   const rootObject = await notion.pages.retrieve({ page_id: ROOT_PAGE_ID }).catch(async (err) => {
     if (err?.code === "validation_error" && err?.message?.includes("database")) {
