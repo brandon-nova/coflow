@@ -5,6 +5,9 @@ on:
     - cron: "0 13 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write  # 🔥 REQUIRED for git push
+
 jobs:
   sync:
     runs-on: ubuntu-latest
