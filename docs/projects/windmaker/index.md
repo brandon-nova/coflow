@@ -1,7 +1,25 @@
 
-# CREATE TEMPLATE
+# Project: 
 
-- Use case
-- Solution pattern
-- Tradeoffs
-- When NOT to use
+
+**Summary:**
+
+
+**Problem Solved:**
+
+
+**Solution:**
+
+
+**Tech Stack:**
+
+
+**Impact:**
+
+
+**Screenshots / Diagrams:**
+
+
+**Lessons learned:**
+
+- 
